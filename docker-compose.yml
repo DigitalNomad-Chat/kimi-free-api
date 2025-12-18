@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  kimi-free-api:
+    # 构建配置
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    # 容器名称
+    container_name: kimi-free-api
+
+    # 端口映射（主机端口:容器端口）
+    ports:
+      - "8000:8000"
+
+    # 环境变量配置
+    environment:
+      - NODE_ENV=production
+      - PORT=8000
+      # 在这里添加其他需要的环境变量
+      # - AUTH_SECRET_KEY=your-secret-key
+      # - MAX_REQUESTS_PER_MINUTE=60
+
+    # 数据卷挂载
+    volumes:
+      # 挂载日志目录
+      - ./logs:/app/logs
+      # 挂载配置文件（如果有）
+      - ./configs:/app/configs
+
+    # 重启策略
+    restart: unless-stopped
+
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    # 资源限制（可选）
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+    # 网络配置
+    networks:
+      - kimi-network
+
+# 网络配置
+networks:
+  kimi-network:
+    driver: bridge
+
+# 数据卷配置（可选）
+volumes:
+  logs:
+    driver: local

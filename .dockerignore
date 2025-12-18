@@ -1,9 +1,66 @@
-logs
-dist
-doc
+# Node.js
 node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 构建输出
+dist
+build
+
+# 开发工具
 .vscode
+.idea
+*.swp
+*.swo
+*~
+
+# 版本控制
 .git
 .gitignore
+
+# 文档和示例
 README.md
+docs
+doc
+examples
+*.md
+
+# 日志文件
+logs
+*.log
+
+# 环境配置
+.env
+.env.local
+.env.*.local
+
+# 临时文件
+tmp
+temp
+.cache
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 测试文件
+test
+tests
+__tests__
+coverage
+.nyc_output
+
+# CI/CD
+.github
+.gitlab-ci.yml
+
+# Docker文件
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# 其他
 *.tar.gz
+*.zip
+*.rar

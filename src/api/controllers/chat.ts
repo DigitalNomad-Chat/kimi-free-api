@@ -10,6 +10,8 @@ import EX from "@/api/consts/exceptions.ts";
 import { createParser } from 'eventsource-parser'
 import logger from '@/lib/logger.ts';
 import util from '@/lib/util.ts';
+import { shouldUseNewFormat } from '@/lib/request-builders/newFormatBuilder.ts';
+import { buildBaseRequestConfig, buildNewFormatRequestBody, buildLegacyFormatRequestBody } from '@/lib/request-senders/unifiedRequestSender.ts';
 
 // 模型名称
 const MODEL_NAME = 'kimi';
@@ -53,6 +55,110 @@ const FILE_MAX_SIZE = 100 * 1024 * 1024;
 const accessTokenMap = new Map();
 // access_token请求队列映射
 const accessTokenRequestQueueMap: Record<string, Function[]> = {};
+
+/**
+ * 检测模型能力
+ *
+ * @param model 模型名称
+ * @returns 模型能力对象
+ */
+function detectModelCapabilities(model: string) {
+  const capabilities = {
+    isStandard: true,
+    isK15: false,
+    isK2: false,
+    supportsTools: false,
+    supportsThinking: false,
+    defaultSearch: false,
+    scenario: "SCENARIO_CHAT" as "SCENARIO_CHAT" | "SCENARIO_K2"
+  };
+
+  // 新的模型命名规范检测
+  if (model.startsWith('kimi-2')) {
+    capabilities.isStandard = false;
+    capabilities.isK2 = true;
+    capabilities.supportsTools = true;
+    capabilities.supportsThinking = true;
+    capabilities.scenario = "SCENARIO_K2";
+
+    // 根据具体后缀设置默认搜索
+    if (model.includes('-search')) {
+      capabilities.defaultSearch = true;
+    } else {
+      capabilities.defaultSearch = false; // kimi-2 默认不开启搜索
+    }
+  } else if (model.startsWith('kimi-1.5')) {
+    capabilities.isStandard = false;
+    capabilities.isK15 = true;
+    capabilities.supportsTools = true;
+    capabilities.supportsThinking = false;
+    capabilities.scenario = "SCENARIO_CHAT";
+
+    // 根据具体后缀设置默认搜索
+    if (model.includes('-search')) {
+      capabilities.defaultSearch = true;
+    } else {
+      capabilities.defaultSearch = false; // kimi-1.5 默认不开启搜索
+    }
+  } else if (model.includes('k2')) {
+    // 兼容旧的k2检测方式
+    capabilities.isStandard = false;
+    capabilities.isK2 = true;
+    capabilities.supportsTools = true;
+    capabilities.supportsThinking = true;
+    capabilities.defaultSearch = true;
+    capabilities.scenario = "SCENARIO_K2";
+  } else if (model.includes('k1.5') || model.includes('k1-5')) {
+    // 兼容旧的k1.5检测方式
+    capabilities.isStandard = false;
+    capabilities.isK15 = true;
+    capabilities.supportsTools = true;
+    capabilities.defaultSearch = true;
+  }
+
+  logger.info(`模型能力检测结果 - 模型: ${model}, 标准模型: ${capabilities.isStandard}, K1.5: ${capabilities.isK15}, K2: ${capabilities.isK2}, 支持工具: ${capabilities.supportsTools}, 支持思考: ${capabilities.supportsThinking}, 默认搜索: ${capabilities.defaultSearch}, 场景: ${capabilities.scenario}`);
+
+  return capabilities;
+}
+
+/**
+ * 处理模型选项
+ *
+ * @param model 模型名称
+ * @param options 用户提供的选项
+ * @returns 处理后的选项
+ */
+function processModelOptions(model: string, options: any = {}) {
+  const capabilities = detectModelCapabilities(model);
+
+  // 智能参数推断
+  const processedOptions = {
+    use_search: options.use_search,
+    use_thinking: options.use_thinking || false,
+    enable_tools: options.enable_tools !== false && capabilities.supportsTools,
+    tools_config: options.tools_config || {}
+  };
+
+  // 默认搜索设置
+  if (processedOptions.use_search === undefined) {
+    processedOptions.use_search = capabilities.defaultSearch;
+  }
+
+  // 新的模型命名规范长思考模式处理
+  if (model.includes('kimi-2-research')) {
+    // kimi-2-research 默认开启长思考模式
+    if (options.use_thinking === undefined) {
+      processedOptions.use_thinking = true;
+    }
+  } else if (capabilities.supportsThinking && options.use_thinking) {
+    // 其他K2模型的显式长思考模式设置
+    processedOptions.use_thinking = true;
+  }
+
+  logger.info(`模型选项处理结果 - 模型: ${model}, 搜索: ${processedOptions.use_search}, 思考: ${processedOptions.use_thinking}, 工具: ${processedOptions.enable_tools}`);
+
+  return processedOptions;
+}
 
 /**
  * 请求access_token
@@ -1071,10 +1177,206 @@ async function getTokenLiveStatus(refreshToken: string) {
   }
 }
 
+/**
+ * 增强版同步对话补全
+ *
+ * @param model 模型名称
+ * @param messages 参考gpt系列消息格式，多轮对话请完整提供上下文
+ * @param refreshToken 用于刷新access_token的refresh_token
+ * @param refConvId 引用会话ID
+ * @param options 增强选项
+ */
+async function createCompletionEnhanced(
+  model = MODEL_NAME,
+  messages: any[],
+  refreshToken: string,
+  refConvId?: string,
+  options: any = {}
+): Promise<IStreamMessage> {
+  // 处理增强选项
+  const processedOptions = processModelOptions(model, options);
+  const capabilities = detectModelCapabilities(model);
+
+  // 记录增强功能使用
+  logger.info(`使用增强功能 - 模型: ${model}, 搜索: ${processedOptions.use_search}, 思考: ${processedOptions.use_thinking}, 工具: ${processedOptions.enable_tools}`);
+
+  try {
+    // 创建或获取会话
+    const convId = /[0-9a-zA-Z]{20}/.test(refConvId) ? refConvId : await createConversation(model, "未命名会话", refreshToken);
+
+    // 处理文件引用
+    const refFileUrls = extractRefFileUrls(messages);
+    const refResults = refFileUrls.length ? await Promise.all(refFileUrls.map(fileUrl => uploadFile(fileUrl, refreshToken, convId))) : [];
+    const refs = refResults.map(result => result.id);
+    const refsFile = refResults.map(result => ({
+      detail: result,
+      done: true,
+      file: {},
+      file_info: result,
+      id: result.id,
+      name: result.name,
+      parse_status: 'success',
+      size: result.size,
+      upload_progress: 100,
+      upload_status: 'success'
+    }));
+
+    // 伪装调用获取用户信息
+    fakeRequest(refreshToken)
+      .catch(err => logger.error(err));
+
+    // 预处理消息
+    const sendMessages = messagesPrepare(messages, !!refConvId);
+
+    // 检查探索版使用量
+    if (model.includes('research')) {
+      const { total, used } = await getResearchUsage(refreshToken);
+      if (used >= total)
+        throw new APIException(EX.API_RESEARCH_EXCEEDS_LIMIT, `探索版使用量已达到上限`);
+      logger.info(`探索版当前额度: ${used}/${total}`);
+    }
+
+    // 阶段二：根据模型能力选择请求格式
+    let requestData;
+    if (shouldUseNewFormat(capabilities)) {
+      logger.info('使用新API格式构建请求');
+      requestData = buildNewFormatRequestBody(model, sendMessages, processedOptions, capabilities, refs, refsFile);
+    } else {
+      logger.info('使用旧API格式构建请求');
+      requestData = buildLegacyFormatRequestBody(model, sendMessages, processedOptions, capabilities, refs, refsFile);
+    }
+
+    // 使用原始的request函数发送请求
+    const stream = await request('POST', `/api/chat/${convId}/completion/stream`, refreshToken, {
+      data: requestData,
+      headers: {
+        Referer: `https://kimi.moonshot.cn/chat/${convId}`
+      },
+      responseType: 'stream'
+    });
+
+    // 接收流式响应并转换为完整消息
+    const answer = await receiveStream(model, convId, stream);
+
+    // 异步移除会话
+    !refConvId && removeConversation(convId, refreshToken)
+      .catch(err => console.error(err));
+
+    return answer;
+
+  } catch (err) {
+    logger.error(`增强版对话补全失败: ${err.message}`);
+
+    // 回退到原始实现
+    logger.info('回退到原始实现');
+    return createCompletion(model, messages, refreshToken, refConvId);
+  }
+}
+
+/**
+ * 增强版流式对话补全
+ *
+ * @param model 模型名称
+ * @param messages 参考gpt系列消息格式，多轮对话请完整提供上下文
+ * @param refreshToken 用于刷新access_token的refresh_token
+ * @param refConvId 引用会话ID
+ * @param options 增强选项
+ */
+async function createCompletionStreamEnhanced(
+  model = MODEL_NAME,
+  messages: any[],
+  refreshToken: string,
+  refConvId?: string,
+  options: any = {}
+) {
+  // 处理增强选项
+  const processedOptions = processModelOptions(model, options);
+  const capabilities = detectModelCapabilities(model);
+
+  // 记录增强功能使用
+  logger.info(`使用增强流功能 - 模型: ${model}, 搜索: ${processedOptions.use_search}, 思考: ${processedOptions.use_thinking}, 工具: ${processedOptions.enable_tools}`);
+
+  try {
+    // 创建或获取会话
+    const convId = /[0-9a-zA-Z]{20}/.test(refConvId) ? refConvId : await createConversation(model, "未命名会话", refreshToken);
+
+    // 处理文件引用
+    const refFileUrls = extractRefFileUrls(messages);
+    const refResults = refFileUrls.length ? await Promise.all(refFileUrls.map(fileUrl => uploadFile(fileUrl, refreshToken, convId))) : [];
+    const refs = refResults.map(result => result.id);
+    const refsFile = refResults.map(result => ({
+      detail: result,
+      done: true,
+      file: {},
+      file_info: result,
+      id: result.id,
+      name: result.name,
+      parse_status: 'success',
+      size: result.size,
+      upload_progress: 100,
+      upload_status: 'success'
+    }));
+
+    // 伪装调用获取用户信息
+    fakeRequest(refreshToken)
+      .catch(err => logger.error(err));
+
+    // 预处理消息
+    const sendMessages = messagesPrepare(messages, !!refConvId);
+
+    // 检查探索版使用量
+    if (model.includes('research')) {
+      const { total, used } = await getResearchUsage(refreshToken);
+      if (used >= total)
+        throw new APIException(EX.API_RESEARCH_EXCEEDS_LIMIT, `探索版使用量已达到上限`);
+      logger.info(`探索版当前额度: ${used}/${total}`);
+    }
+
+    // 阶段二：根据模型能力选择请求格式
+    let requestData;
+    if (shouldUseNewFormat(capabilities)) {
+      logger.info('使用新API格式构建流请求');
+      requestData = buildNewFormatRequestBody(model, sendMessages, processedOptions, capabilities, refs, refsFile);
+    } else {
+      logger.info('使用旧API格式构建流请求');
+      requestData = buildLegacyFormatRequestBody(model, sendMessages, processedOptions, capabilities, refs, refsFile);
+    }
+
+    // 使用原始的request函数发送流式请求
+    const stream = await request('POST', `/api/chat/${convId}/completion/stream`, refreshToken, {
+      data: requestData,
+      headers: {
+        Referer: `https://kimi.moonshot.cn/chat/${convId}`
+      },
+      responseType: 'stream'
+    });
+
+    // 创建转换流（保持与原有格式兼容）
+    const transStream = createTransStream(model, convId, stream, () => {
+      logger.success(`增强流传输完成`);
+      // 异步移除会话
+      !refConvId && removeConversation(convId, refreshToken)
+        .catch(err => console.error(err));
+    });
+
+    return transStream;
+
+  } catch (err) {
+    logger.error(`增强版流式对话补全失败: ${err.message}`);
+
+    // 回退到原始实现
+    logger.info('回退到原始流实现');
+    return createCompletionStream(model, messages, refreshToken, refConvId);
+  }
+}
+
+
 export default {
   createConversation,
   createCompletion,
   createCompletionStream,
+  createCompletionEnhanced,
+  createCompletionStreamEnhanced,
   getTokenLiveStatus,
   tokenSplit
 };
